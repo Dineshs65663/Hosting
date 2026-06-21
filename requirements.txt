@@ -1,0 +1,59 @@
+# Core dependencies
+pyTelegramBotAPI>=4.15.0
+psutil>=5.9.0
+Flask>=2.3.0
+requests>=2.31.0
+
+# Optional but recommended (for script execution)
+httpx>=0.25.0
+python-telegram-bot>=20.0
+aiogram>=2.25.0
+pyrogram>=2.0.0
+telethon>=1.34.0
+
+# Common utilities used by uploaded scripts
+beautifulsoup4>=4.12.0
+Pillow>=10.0.0
+opencv-python>=4.8.0
+PyYAML>=6.0
+python-dotenv>=1.0.0
+python-dateutil>=2.8.0
+pandas>=2.0.0
+numpy>=1.24.0
+SQLAlchemy>=2.0.0
+
+# Telegram related modules
+telepot>=12.7
+pytg>=1.0
+tgcrypto>=1.0
+telegram-upload>=0.7
+telegram-send>=0.31
+telegram-text>=0.3
+mtproto>=1.0
+python-telegram-handlers>=0.1
+telegram-redis>=0.1
+telegram-sqlalchemy>=0.1
+pytest-telegram>=0.1
+
+# AI and NLP
+telegram-nlp-toolkit>=0.1
+telegram-ai>=0.1
+telegram-translate>=0.1
+
+# Media processing
+telegram-ffmpeg>=0.1
+telegram-media-utils>=0.1
+
+# Security and crypto
+telegram-twofa>=0.1
+telegram-crypto-bot>=0.1
+
+# Internationalization
+telegram-i18n>=0.1
+
+# Database
+sqlite3  # Built-in, no install needed
+
+# Core Python modules (built-in, no install needed)
+# asyncio, json, datetime, os, sys, re, time, math, random, logging,
+# threading, subprocess, zipfile, tempfile, shutil, sqlite3, atexit, signal
