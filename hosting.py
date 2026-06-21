@@ -59,7 +59,7 @@ TOKEN = '8976866439:AAF4escWUv5tppxjB4zGfMV7woksxi6IFHI' #bot token dalo yeha
 OWNER_ID =8767249265 #yha tumhra chat id dalo
 ADMIN_ID =8767249265 #yeha koi admin ya tumhara chat id dalo
 YOUR_USERNAME = '@DKS65663' #yeha tumhra username dala
-UPDATE_CHANNEL = 'https://t.me/dksinfo2266' #yeha chnl link dalo
+UPDATE_CHANNEL = 'https://t.me/dkschattinggroup' #yeha chnl link dalo
 FORCE_JOIN_CHANNELS = [
     "@dksinfo2266",
 ]
