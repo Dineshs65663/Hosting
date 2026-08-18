@@ -1,43 +1,26 @@
-# ========== CORE ==========
 Flask>=2.3.0
-requests>=2.31.0
-werkzeug>=3.0.0
+aiogram>=3.0.0
+beautifulsoup4>=4.12.0
+blinker>=1.7.0
+click>=8.1.0
+httpx>=0.25.0
+itsdangerous>=2.1.0
 jinja2>=3.1.0
 markupsafe>=2.1.0
-itsdangerous>=2.1.0
-click>=8.1.0
-blinker>=1.7.0
-python-dotenv>=1.0.0
-
-# ========== TELEGRAM BOTS ==========
-pyTelegramBotAPI>=4.15.0
-python-telegram-bot>=20.0
-aiogram>=3.0.0
-telethon>=1.34.0
-pyrogram>=2.0.0
-tgcrypto>=1.2.0
-
-# ========== WEB SCRAPING ==========
-beautifulsoup4>=4.12.0
-httpx>=0.25.0
-
-# ========== IMAGE PROCESSING ==========
-Pillow>=10.0.0
-
-# ========== DATA ==========
-PyYAML>=6.0
-python-dateutil>=2.8.0
-pandas>=2.0.0
 numpy>=1.24.0
-SQLAlchemy>=2.0.0
-
-# ========== SYSTEM ==========
+pandas>=2.0.0
+Pillow>=10.0.0
 psutil>=5.9.0
-
-# ========== TELEGRAM UPLOAD TOOLS ==========
-telegram-upload>=0.7
+pyrogram>=2.0.0
+pyTelegramBotAPI>=4.15.0
+python-dateutil>=2.8.0
+python-dotenv>=1.0.0
+python-telegram-bot>=20.0
+PyYAML>=6.0
+requests>=2.31.0
+SQLAlchemy>=2.0.0
 telegram-send>=0.31
-
-# ========== OPTIONAL (Remove if failing) ==========
-# opencv-python>=4.8.0  # HEAVY – install separately if needed
-# telepot>=12.7         # DEPRECATED – remove
+telegram-upload>=0.7
+telethon>=1.34.0
+tgcrypto>=1.2.0
+werkzeug>=3.0.0
