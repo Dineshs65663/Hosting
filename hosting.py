@@ -26,9 +26,10 @@ import hashlib
 import mimetypes
 import sqlite3
 import atexit
+import psutil
 import requests
 from datetime import datetime, timedelta
-from telebot import types
+from telebot import types, apihelper
 from threading import Thread
 from logging.handlers import RotatingFileHandler
 from flask import Flask
@@ -43,6 +44,8 @@ ADMIN_ID     = 8767249265
 YOUR_USERNAME   = '@DKS65663'
 UPDATE_CHANNEL  = 'https://t.me/dkschattinggroup'
 FORCE_JOIN_CHANNELS = ["@dksinfo2266"]
+
+BOT_VERSION = "v2.1 (stabilized)"
 
 # Limits
 FREE_USER_LIMIT       = 10
@@ -61,6 +64,9 @@ WATCHDOG_INTERVAL = 12     # seconds between watchdog checks
 STREAM_INTERVAL   = 5      # seconds between log stream messages
 STREAM_MAX_MSGS   = 12     # stop streaming after N messages
 
+# Files per page in the "My Files" UI
+FILES_PER_PAGE = 8
+
 # ════════════════════════════════════════════════════════════════════════════
 #  PATHS
 # ════════════════════════════════════════════════════════════════════════════
@@ -69,6 +75,7 @@ UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, 'upload_bots')
 DATA_DIR        = os.path.join(BASE_DIR, 'data')
 DATABASE_PATH   = os.path.join(DATA_DIR, 'bot_data.db')
 LOG_FILE_PATH   = os.path.join(DATA_DIR, 'bot_main.log')
+LOCK_FILE_PATH  = os.path.join(DATA_DIR, 'bot.lock')
 
 for _d in (UPLOAD_BOTS_DIR, DATA_DIR):
     os.makedirs(_d, exist_ok=True)
@@ -84,9 +91,61 @@ _fh.setFormatter(logging.Formatter(_log_fmt))
 logger.addHandler(_fh)
 
 # ════════════════════════════════════════════════════════════════════════════
+#  SINGLE-INSTANCE LOCK  (fixes: two processes fighting over getUpdates → 409s)
+# ════════════════════════════════════════════════════════════════════════════
+def _acquire_lock():
+    if os.path.exists(LOCK_FILE_PATH):
+        try:
+            with open(LOCK_FILE_PATH) as f:
+                old_pid = int(f.read().strip())
+            if psutil.pid_exists(old_pid):
+                try:
+                    p = psutil.Process(old_pid)
+                    # Make sure it's actually still *this* script, not a recycled PID
+                    if 'python' in p.name().lower() or any('hostbot' in c.lower() for c in p.cmdline()):
+                        logger.critical(
+                            f"Another HostBot instance is already running (PID {old_pid}). "
+                            f"Refusing to start a second poller — this is what causes 409 Conflict "
+                            f"errors and silent infinite restart loops. Kill the old process first."
+                        )
+                        sys.exit(1)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except (ValueError, FileNotFoundError):
+            pass
+    with open(LOCK_FILE_PATH, 'w') as f:
+        f.write(str(os.getpid()))
+
+def _release_lock():
+    try:
+        if os.path.exists(LOCK_FILE_PATH):
+            with open(LOCK_FILE_PATH) as f:
+                if f.read().strip() == str(os.getpid()):
+                    os.remove(LOCK_FILE_PATH)
+    except Exception:
+        pass
+
+# ════════════════════════════════════════════════════════════════════════════
+#  GLOBAL EXCEPTION HANDLER FOR BOT WORKER THREADS
+#  (fixes: unhandled exceptions inside handlers silently killing worker threads
+#   with no log line and no recovery — this is your "so many errors" source)
+# ════════════════════════════════════════════════════════════════════════════
+class _BotExceptionHandler(telebot.ExceptionHandler):
+    def handle(self, exception):
+        logger.error(f"Unhandled exception in bot handler: {exception}", exc_info=True)
+        return True  # True = suppress, keep the bot alive instead of crashing the thread
+
+apihelper.RETRY_ON_ERROR = True
+apihelper.CONNECT_TIMEOUT = 15
+apihelper.READ_TIMEOUT = 30
+
+# ════════════════════════════════════════════════════════════════════════════
 #  BOT INIT
 # ════════════════════════════════════════════════════════════════════════════
-bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=8)
+bot = telebot.TeleBot(
+    TOKEN, threaded=True, num_threads=8,
+    exception_handler=_BotExceptionHandler()
+)
 
 # ════════════════════════════════════════════════════════════════════════════
 #  IN-MEMORY STATE
@@ -99,6 +158,7 @@ admin_ids         = {ADMIN_ID, OWNER_ID}
 pending_approvals = {}          # approval_id → approval_info
 bot_locked        = False
 _bot_lock_event   = threading.Lock()
+_shutting_down    = threading.Event()
 
 # Rate limiting
 _last_upload      = {}          # user_id → timestamp
@@ -107,6 +167,9 @@ _last_cmd         = {}          # user_id → timestamp
 # Watchdog registry
 _watchdog_threads = {}          # script_key → Thread
 _watchdog_restarting = set()    # scripts being restarted
+
+# File-list pagination state
+_files_page       = {}          # user_id → current page index
 
 # Stream sessions
 _stream_sessions  = {}          # user_id → {script_key, msg_count, active}
@@ -118,7 +181,11 @@ _flask_app = Flask('')
 
 @_flask_app.route('/')
 def _home():
-    return f"HostBot running — {len(bot_scripts)} scripts active."
+    return f"HostBot {BOT_VERSION} running — {len(bot_scripts)} scripts active."
+
+@_flask_app.route('/health')
+def _health():
+    return {"status": "ok", "scripts_running": len(bot_scripts), "users": len(active_users)}
 
 def _run_flask():
     _flask_app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
@@ -134,7 +201,9 @@ def keep_alive():
 _DB_LOCK = threading.Lock()
 
 def _db():
-    return sqlite3.connect(DATABASE_PATH, check_same_thread=False, timeout=10)
+    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False, timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')  # fixes: "database is locked" under concurrent threads
+    return conn
 
 def init_db():
     with _DB_LOCK:
@@ -198,7 +267,6 @@ def load_data():
 
 def _expire_stale_approvals():
     """Expire pending approvals older than APPROVE_TIMEOUT"""
-    now = datetime.now().isoformat()
     with _DB_LOCK:
         conn = _db()
         c = conn.cursor()
@@ -216,16 +284,18 @@ def _expire_stale_approvals():
                     bot.send_message(admin_uid,
                                      f"⏰ Approval <code>{aid}</code> for <code>{uid}</code> ({fn}) EXPIRED.",
                                      parse_mode='HTML')
-                except: pass
+                except Exception:
+                    pass
             try:
                 bot.send_message(uid,
                                  f"⏰ Your file <b>{fn}</b> approval expired (1hr timeout). Re-upload if needed.",
                                  parse_mode='HTML')
-            except: pass
+            except Exception:
+                pass
             info = pending_approvals.get(aid)
             if info and os.path.exists(info.get('file_path', '')):
                 try: os.remove(info['file_path'])
-                except: pass
+                except Exception: pass
             pending_approvals.pop(aid, None)
         conn.commit()
         conn.close()
@@ -348,7 +418,7 @@ def _entropy(data: bytes) -> float:
     total = len(data)
     return -sum((f / total) * math.log2(f / total) for f in freq.values())
 
-def scan_file(content: bytes, filename: str, uid: int) -> tuple[bool, str]:
+def scan_file(content: bytes, filename: str, uid: int) -> tuple:
     """Returns (is_safe, reason). Owner always passes."""
     if uid == OWNER_ID:
         return True, "Owner bypass"
@@ -410,7 +480,6 @@ def is_running(uid, fn) -> bool:
     if not info:
         return False
     try:
-        import psutil
         proc = psutil.Process(info['process'].pid)
         alive = proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
         if not alive:
@@ -426,14 +495,13 @@ def _cleanup_key(key):
         lf = info.get('log_file')
         if lf and not lf.closed:
             try: lf.close()
-            except: pass
+            except Exception: pass
 
 def kill_tree(info: dict):
-    import psutil
     lf = info.get('log_file')
     if lf and not lf.closed:
         try: lf.close()
-        except: pass
+        except Exception: pass
     proc = info.get('process')
     if not proc:
         return
@@ -442,11 +510,11 @@ def kill_tree(info: dict):
         children = parent.children(recursive=True)
         for ch in children:
             try: ch.terminate()
-            except: pass
+            except Exception: pass
         psutil.wait_procs(children, timeout=2)
         for ch in children:
             try: ch.kill()
-            except: pass
+            except Exception: pass
         try: parent.terminate(); parent.wait(timeout=2)
         except psutil.TimeoutExpired: parent.kill()
         except psutil.NoSuchProcess: pass
@@ -475,13 +543,16 @@ def pip_install(module, message_obj):
     if pkg is None:
         return False
     try:
-        bot.reply_to(message_obj, f"📦 Installing `{pkg}`…", parse_mode='HTML')
+        bot.reply_to(message_obj, f"📦 Installing <code>{pkg}</code>…", parse_mode='HTML')
         r = subprocess.run([sys.executable, '-m', 'pip', 'install', pkg, '-q'],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, timeout=180)
         if r.returncode == 0:
             bot.reply_to(message_obj, f"✅ <code>{pkg}</code> installed.", parse_mode='HTML')
             return True
         bot.reply_to(message_obj, f"❌ Install failed:\n<pre>{(r.stderr or r.stdout)[:800]}</pre>", parse_mode='HTML')
+        return False
+    except subprocess.TimeoutExpired:
+        bot.reply_to(message_obj, f"❌ Install of <code>{pkg}</code> timed out.", parse_mode='HTML')
         return False
     except Exception as e:
         bot.reply_to(message_obj, f"❌ Install error: {e}")
@@ -489,15 +560,17 @@ def pip_install(module, message_obj):
 
 def npm_install(module, folder, message_obj):
     try:
-        bot.reply_to(message_obj, f"📦 npm installing `{module}`…", parse_mode='HTML')
-        r = subprocess.run(['npm', 'install', module], capture_output=True, text=True, cwd=folder)
+        bot.reply_to(message_obj, f"📦 npm installing <code>{module}</code>…", parse_mode='HTML')
+        r = subprocess.run(['npm', 'install', module], capture_output=True, text=True, cwd=folder, timeout=180)
         if r.returncode == 0:
             bot.reply_to(message_obj, f"✅ <code>{module}</code> installed.", parse_mode='HTML')
             return True
         bot.reply_to(message_obj, f"❌ npm failed:\n<pre>{(r.stderr or r.stdout)[:800]}</pre>", parse_mode='HTML')
         return False
     except FileNotFoundError:
-        bot.reply_to(message_obj, "❌ `node`/`npm` not found."); return False
+        bot.reply_to(message_obj, "❌ <code>node</code>/<code>npm</code> not found on this VPS.", parse_mode='HTML'); return False
+    except subprocess.TimeoutExpired:
+        bot.reply_to(message_obj, f"❌ npm install of <code>{module}</code> timed out.", parse_mode='HTML'); return False
     except Exception as e:
         bot.reply_to(message_obj, f"❌ npm error: {e}"); return False
 
@@ -600,8 +673,10 @@ def _start_watchdog(script_key, uid, fn, folder, ft, reply_msg):
 
 def _watchdog_loop(script_key, uid, fn, folder, ft, reply_msg):
     time.sleep(WATCHDOG_INTERVAL * 2)
-    while script_key in bot_scripts:
+    while script_key in bot_scripts and not _shutting_down.is_set():
         time.sleep(WATCHDOG_INTERVAL)
+        if _shutting_down.is_set():
+            break
         if script_key not in bot_scripts:
             break
         if script_key in _watchdog_restarting:
@@ -612,7 +687,8 @@ def _watchdog_loop(script_key, uid, fn, folder, ft, reply_msg):
             try:
                 bot.send_message(reply_msg.chat.id,
                                  f"🔄 <b>{fn}</b> crashed — auto-restarting…", parse_mode='HTML')
-            except: pass
+            except Exception:
+                pass
             path = os.path.join(folder, fn)
             if os.path.exists(path):
                 if ft == 'py':
@@ -644,7 +720,8 @@ def submit_for_approval(uid, fn, ft, file_path, user_name, reply_msg):
     )
     markup.add(types.InlineKeyboardButton("👤 View User Info", callback_data=f"appr_info_{aid}"))
 
-    notif = (f"🔔 <b>New File Pending Approval</b>\n\n"
+    notif = (f"🔔 <b>New File Pending Approval</b>\n"
+             f"──────────────\n"
              f"👤 User: <code>{uid}</code> (@{user_name or 'unknown'})\n"
              f"📄 File: <code>{fn}</code> ({ft})\n"
              f"🕐 At: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -653,7 +730,8 @@ def submit_for_approval(uid, fn, ft, file_path, user_name, reply_msg):
     for admin_uid in admin_ids:
         try:
             bot.send_message(admin_uid, notif, reply_markup=markup, parse_mode='HTML')
-        except: pass
+        except Exception:
+            pass
 
     bot.reply_to(reply_msg,
                  f"⏳ <b>{fn}</b> submitted for admin approval.\nYou'll be notified once reviewed.",
@@ -669,7 +747,7 @@ def is_joined_all(uid) -> bool:
             m = bot.get_chat_member(ch, uid)
             if m.status not in ('member', 'administrator', 'creator'):
                 return False
-        except:
+        except Exception:
             return False
     return True
 
@@ -679,29 +757,34 @@ def send_force_join(chat_id):
         markup.add(types.InlineKeyboardButton(
             f"📢 Join {ch.replace('@','')}", url=f"https://t.me/{ch.replace('@','')}"))
     markup.add(types.InlineKeyboardButton("✅ I Joined", callback_data="force_join_check"))
-    bot.send_message(chat_id, "⛔ Join all channels first:", reply_markup=markup)
+    bot.send_message(chat_id, "⛔ <b>Join the channel(s) below to use this bot:</b>",
+                      reply_markup=markup, parse_mode='HTML')
 
 # ════════════════════════════════════════════════════════════════════════════
-#  MENUS
+#  MENUS  (redesigned: grouped sections, consistent icons, clearer hierarchy)
 # ════════════════════════════════════════════════════════════════════════════
 def main_inline(uid):
     mk = types.InlineKeyboardMarkup(row_width=2)
-    mk.add(types.InlineKeyboardButton('📢 Channel', url=UPDATE_CHANNEL))
-    mk.add(types.InlineKeyboardButton('📤 Upload', callback_data='upload'),
+    # Core actions
+    mk.add(types.InlineKeyboardButton('📤 Upload File', callback_data='upload'),
            types.InlineKeyboardButton('📂 My Files', callback_data='check_files'))
-    mk.add(types.InlineKeyboardButton('⚡ Ping', callback_data='speed'),
-           types.InlineKeyboardButton('📊 Stats', callback_data='stats'))
+    mk.add(types.InlineKeyboardButton('📊 My Stats', callback_data='stats'),
+           types.InlineKeyboardButton('⚡ Ping', callback_data='speed'))
     mk.add(types.InlineKeyboardButton('📜 Stream Logs', callback_data='stream_menu'),
-           types.InlineKeyboardButton('📤 Send CMD', callback_data='send_command'))
-    mk.add(types.InlineKeyboardButton('📞 Contact Owner',
-           url=f"https://t.me/{YOUR_USERNAME.replace('@','')}"))
+           types.InlineKeyboardButton('⌨️ Send Command', callback_data='send_command'))
+    # Info / links
+    mk.add(types.InlineKeyboardButton('📢 Update Channel', url=UPDATE_CHANNEL),
+           types.InlineKeyboardButton('📞 Contact Owner',
+                                       url=f"https://t.me/{YOUR_USERNAME.replace('@','')}"))
     if uid in admin_ids:
+        mk.add(types.InlineKeyboardButton('━━━ 👑 ADMIN ━━━', callback_data='noop'))
         mk.add(types.InlineKeyboardButton('💳 Subscriptions', callback_data='subscription'),
-               types.InlineKeyboardButton('📢 Broadcast', callback_data='broadcast'))
-        mk.add(types.InlineKeyboardButton('🔒 Lock/Unlock', callback_data='toggle_lock'),
-               types.InlineKeyboardButton('🟢 Run All', callback_data='run_all_scripts'))
-        mk.add(types.InlineKeyboardButton('⏳ Approvals', callback_data='list_approvals'),
                types.InlineKeyboardButton('👑 Admin Panel', callback_data='admin_panel'))
+        mk.add(types.InlineKeyboardButton('📢 Broadcast', callback_data='broadcast'),
+               types.InlineKeyboardButton('⏳ Approvals', callback_data='list_approvals'))
+        mk.add(types.InlineKeyboardButton(
+                   '🔓 Unlock Bot' if bot_locked else '🔒 Lock Bot', callback_data='toggle_lock'),
+               types.InlineKeyboardButton('🟢 Run All Scripts', callback_data='run_all_scripts'))
     return mk
 
 def control_buttons(uid, fn, running=True):
@@ -716,7 +799,7 @@ def control_buttons(uid, fn, running=True):
         mk.row(types.InlineKeyboardButton("🟢 Start",   callback_data=f'start_{uid}_{fn}'),
                types.InlineKeyboardButton("📋 Logs",    callback_data=f'logs_{uid}_{fn}'))
         mk.add(types.InlineKeyboardButton("🗑️ Delete",  callback_data=f'delete_{uid}_{fn}'))
-    mk.add(types.InlineKeyboardButton("🔙 Back", callback_data='check_files'))
+    mk.add(types.InlineKeyboardButton("🔙 Back to Files", callback_data='check_files'))
     return mk
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -730,7 +813,7 @@ def send_welcome(message):
     if uid not in admin_ids and not is_joined_all(uid):
         send_force_join(message.chat.id); return
     if bot_locked and uid not in admin_ids:
-        bot.send_message(message.chat.id, "🔒 Bot locked by admin."); return
+        bot.send_message(message.chat.id, "🔒 Bot is currently locked by admin. Try again later."); return
 
     if uid not in active_users:
         db_add_user(uid)
@@ -740,20 +823,23 @@ def send_welcome(message):
     cnt = file_count(uid)
     lim_str = str(int(lim)) if lim != float('inf') else "∞"
 
-    text = (f"👋 Welcome, <b>{name}</b>!\n\n"
-            f"🆔 <code>{uid}</code>  |  @{uname or 'no username'}\n"
-            f"🔰 {user_status_str(uid)}\n"
-            f"📁 Files: <b>{cnt}/{lim_str}</b>\n\n"
-            f"Upload <code>.py</code>, <code>.js</code>, or <code>.zip</code> to host & run scripts.\n"
+    text = (f"👋 <b>Welcome, {name}!</b>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🆔 <code>{uid}</code>  ·  @{uname or 'no username'}\n"
+            f"🔰 Status: {user_status_str(uid)}\n"
+            f"📁 Files: <b>{cnt}/{lim_str}</b>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"Upload a <code>.py</code>, <code>.js</code>, or <code>.zip</code> to host & run it.\n"
             f"All files require admin approval before execution.")
     bot.send_message(message.chat.id, text, reply_markup=main_inline(uid), parse_mode='HTML')
 
 def _notify_owner_new_user(uid, name, uname, message):
     try:
-        txt = (f"🆕 New user!\n👤 {name}  @{uname or 'N/A'}\n"
+        txt = (f"🆕 <b>New user</b>\n👤 {name}  @{uname or 'N/A'}\n"
                f"🆔 <code>{uid}</code>")
         bot.send_message(OWNER_ID, txt, parse_mode='HTML')
-    except: pass
+    except Exception:
+        pass
 
 # ════════════════════════════════════════════════════════════════════════════
 #  FILE UPLOAD HANDLER
@@ -797,14 +883,16 @@ def handle_upload(message):
             bot.send_message(OWNER_ID,
                              f"🚨 Blocked upload from <code>{uid}</code> (@{uname})\n"
                              f"File: <code>{fn}</code>\nReason: {reason}", parse_mode='HTML')
-        except: pass
+        except Exception:
+            pass
         return
 
     try:
         bot.send_message(OWNER_ID,
                          f"📤 Upload from <code>{uid}</code> (@{uname})\n"
                          f"File: <code>{fn}</code>  ({doc.file_size//1024}KB)", parse_mode='HTML')
-    except: pass
+    except Exception:
+        pass
 
     uf = user_folder(uid)
 
@@ -868,13 +956,13 @@ def _handle_zip(data, zip_name, uid, uname, uf, message):
         if 'requirements.txt' in items:
             r = subprocess.run([sys.executable,'-m','pip','install','-r',
                                 os.path.join(tmp,'requirements.txt'),'-q'],
-                               capture_output=True)
+                               capture_output=True, timeout=300)
             if r.returncode != 0:
                 bot.reply_to(message, f"❌ pip install failed:\n<pre>{r.stderr[:600]}</pre>",
                              parse_mode='HTML'); return
 
         if 'package.json' in items:
-            r = subprocess.run(['npm','install'], capture_output=True, cwd=tmp)
+            r = subprocess.run(['npm','install'], capture_output=True, cwd=tmp, timeout=300)
             if r.returncode != 0:
                 bot.reply_to(message, f"❌ npm install failed:\n<pre>{r.stderr[:600]}</pre>",
                              parse_mode='HTML'); return
@@ -895,6 +983,8 @@ def _handle_zip(data, zip_name, uid, uname, uf, message):
             submit_for_approval(uid, main, ft, fp, uname, message)
     except zipfile.BadZipFile:
         bot.reply_to(message, "❌ Invalid zip file.")
+    except subprocess.TimeoutExpired:
+        bot.reply_to(message, "❌ Dependency install timed out.")
     except Exception as e:
         logger.error(f"Zip error uid={uid}: {e}", exc_info=True)
         bot.reply_to(message, f"❌ Zip error: {e}")
@@ -932,7 +1022,7 @@ def _stream_loop(uid, key, fn, chat_id):
 
     pos = os.path.getsize(log_path)
     count = 0
-    while _stream_sessions.get(uid, {}).get('active') and count < STREAM_MAX_MSGS:
+    while _stream_sessions.get(uid, {}).get('active') and count < STREAM_MAX_MSGS and not _shutting_down.is_set():
         time.sleep(STREAM_INTERVAL)
         if key not in bot_scripts:
             bot.send_message(chat_id, f"⚠️ <b>{fn}</b> stopped.", parse_mode='HTML')
@@ -1020,6 +1110,10 @@ def cb_force_join(c):
     else:
         bot.answer_callback_query(c.id, "❌ Not joined yet.", show_alert=True)
 
+@bot.callback_query_handler(func=lambda c: c.data == 'noop')
+def cb_noop(c):
+    bot.answer_callback_query(c.id)
+
 @bot.callback_query_handler(func=lambda c: True)
 def cb_router(c):
     uid  = c.from_user.id
@@ -1037,6 +1131,7 @@ def cb_router(c):
     if data == 'list_approvals':
         _cb_list_approvals(c); return
 
+    if data.startswith('filespage_'): _cb_files_page(c);  return
     if data.startswith('file_'):   _cb_file_control(c);  return
     if data.startswith('start_'):  _cb_start(c);         return
     if data.startswith('stop_'):   _cb_stop(c);          return
@@ -1097,7 +1192,8 @@ def _cb_approve(call, aid, approved):
         try:
             bot.send_message(rc, f"✅ Your file <b>{fn}</b> was <b>approved</b>! Starting…",
                              parse_mode='HTML')
-        except: pass
+        except Exception:
+            pass
         uf = user_folder(target_uid)
         class _FakeMsg:
             chat = type('c', (), {'id': rc})()
@@ -1108,22 +1204,25 @@ def _cb_approve(call, aid, approved):
                 f"✅ <b>Approved</b> by {call.from_user.first_name}\n"
                 f"File: <code>{fn}</code>  User: <code>{target_uid}</code>",
                 call.message.chat.id, call.message.message_id, parse_mode='HTML')
-        except: pass
+        except Exception:
+            pass
     else:
         bot.answer_callback_query(call.id, f"❌ Rejected {fn}")
         try:
             bot.send_message(rc, f"❌ Your file <b>{fn}</b> was <b>rejected</b> by admin.",
                              parse_mode='HTML')
-        except: pass
+        except Exception:
+            pass
         if os.path.exists(fp):
             try: os.remove(fp)
-            except: pass
+            except Exception: pass
         try:
             bot.edit_message_text(
                 f"❌ <b>Rejected</b> by {call.from_user.first_name}\n"
                 f"File: <code>{fn}</code>  User: <code>{target_uid}</code>",
                 call.message.chat.id, call.message.message_id, parse_mode='HTML')
-        except: pass
+        except Exception:
+            pass
 
 def _cb_appr_info(call, aid):
     info = pending_approvals.get(aid)
@@ -1172,7 +1271,7 @@ def _cb_file_control(c):
     uid = c.from_user.id
     try:
         owner_uid, fn = _parse_file_cb(c.data)
-    except:
+    except Exception:
         bot.answer_callback_query(c.id, "Parse error."); return
     if uid != owner_uid and uid not in admin_ids:
         bot.answer_callback_query(c.id, "Permission denied.", show_alert=True); return
@@ -1187,12 +1286,13 @@ def _cb_file_control(c):
             c.message.chat.id, c.message.message_id,
             reply_markup=control_buttons(owner_uid, fn, running),
             parse_mode='HTML')
-    except: pass
+    except Exception:
+        pass
 
 def _cb_start(c):
     uid = c.from_user.id
     try: owner_uid, fn = _parse_file_cb(c.data)
-    except: bot.answer_callback_query(c.id,"Parse error."); return
+    except Exception: bot.answer_callback_query(c.id,"Parse error."); return
     if uid != owner_uid and uid not in admin_ids:
         bot.answer_callback_query(c.id,"Permission denied.",show_alert=True); return
     if is_running(owner_uid, fn):
@@ -1209,7 +1309,7 @@ def _cb_start(c):
 def _cb_stop(c):
     uid = c.from_user.id
     try: owner_uid, fn = _parse_file_cb(c.data)
-    except: bot.answer_callback_query(c.id,"Parse error."); return
+    except Exception: bot.answer_callback_query(c.id,"Parse error."); return
     if uid != owner_uid and uid not in admin_ids:
         bot.answer_callback_query(c.id,"Permission denied.",show_alert=True); return
     key = f"{owner_uid}_{fn}"
@@ -1223,12 +1323,13 @@ def _cb_stop(c):
             f"⚙️ <b>{fn}</b> ({ft}) — 🔴 Stopped",
             c.message.chat.id, c.message.message_id,
             reply_markup=control_buttons(owner_uid, fn, False), parse_mode='HTML')
-    except: pass
+    except Exception:
+        pass
 
 def _cb_restart(c):
     uid = c.from_user.id
     try: owner_uid, fn = _parse_file_cb(c.data)
-    except: bot.answer_callback_query(c.id,"Parse error."); return
+    except Exception: bot.answer_callback_query(c.id,"Parse error."); return
     if uid != owner_uid and uid not in admin_ids:
         bot.answer_callback_query(c.id,"Permission denied.",show_alert=True); return
     key = f"{owner_uid}_{fn}"
@@ -1246,7 +1347,7 @@ def _cb_restart(c):
 def _cb_delete(c):
     uid = c.from_user.id
     try: owner_uid, fn = _parse_file_cb(c.data)
-    except: bot.answer_callback_query(c.id,"Parse error."); return
+    except Exception: bot.answer_callback_query(c.id,"Parse error."); return
     if uid != owner_uid and uid not in admin_ids:
         bot.answer_callback_query(c.id,"Permission denied.",show_alert=True); return
     key = f"{owner_uid}_{fn}"
@@ -1258,18 +1359,19 @@ def _cb_delete(c):
         p = os.path.join(uf, f)
         if os.path.exists(p):
             try: os.remove(p)
-            except: pass
+            except Exception: pass
     db_remove_file(owner_uid, fn)
     bot.answer_callback_query(c.id, f"🗑️ {fn} deleted")
     try:
         bot.edit_message_text(f"🗑️ <code>{fn}</code> deleted.",
                               c.message.chat.id, c.message.message_id, parse_mode='HTML')
-    except: pass
+    except Exception:
+        pass
 
 def _cb_logs(c):
     uid = c.from_user.id
     try: owner_uid, fn = _parse_file_cb(c.data)
-    except: bot.answer_callback_query(c.id,"Parse error."); return
+    except Exception: bot.answer_callback_query(c.id,"Parse error."); return
     if uid != owner_uid and uid not in admin_ids:
         bot.answer_callback_query(c.id,"Permission denied.",show_alert=True); return
     uf = user_folder(owner_uid)
@@ -1300,7 +1402,7 @@ def _cb_logs(c):
 def _cb_stream(c):
     uid = c.from_user.id
     try: owner_uid, fn = _parse_file_cb(c.data)
-    except: bot.answer_callback_query(c.id,"Parse error."); return
+    except Exception: bot.answer_callback_query(c.id,"Parse error."); return
     if uid != owner_uid and uid not in admin_ids:
         bot.answer_callback_query(c.id,"Permission denied.",show_alert=True); return
     bot.answer_callback_query(c.id)
@@ -1320,32 +1422,66 @@ def _cb_upload(c):
                      "📤 Send your <code>.py</code>, <code>.js</code>, or <code>.zip</code> file.",
                      parse_mode='HTML')
 
-def _send_files(uid, chat_id, call=None):
-    files = user_files.get(uid, [])
+def _send_files(uid, chat_id, call=None, page=None):
+    files = sorted(user_files.get(uid, []))
     if not files:
         txt = "📂 No files uploaded yet."
         if call:
-            try: bot.answer_callback_query(call.id); bot.send_message(chat_id, txt)
-            except: pass
+            try:
+                bot.answer_callback_query(call.id)
+                bot.edit_message_text(txt, chat_id, call.message.message_id,
+                                       reply_markup=main_inline(uid))
+            except Exception:
+                bot.send_message(chat_id, txt)
         else:
             bot.send_message(chat_id, txt)
         return
+
+    if page is None:
+        page = _files_page.get(uid, 0)
+    total_pages = max(1, math.ceil(len(files) / FILES_PER_PAGE))
+    page = max(0, min(page, total_pages - 1))
+    _files_page[uid] = page
+
+    start = page * FILES_PER_PAGE
+    chunk = files[start:start + FILES_PER_PAGE]
+
     mk = types.InlineKeyboardMarkup(row_width=1)
-    for fn, ft in sorted(files):
+    for fn, ft in chunk:
         run = is_running(uid, fn)
         mk.add(types.InlineKeyboardButton(
             f"{'🟢' if run else '🔴'} {fn} ({ft})",
             callback_data=f'file_{uid}_{fn}'))
+
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(types.InlineKeyboardButton("◀️ Prev", callback_data=f'filespage_{uid}_{page-1}'))
+        nav.append(types.InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data='noop'))
+        if page < total_pages - 1:
+            nav.append(types.InlineKeyboardButton("Next ▶️", callback_data=f'filespage_{uid}_{page+1}'))
+        mk.row(*nav)
+
     mk.add(types.InlineKeyboardButton("🔙 Back", callback_data='back_main'))
-    txt = f"📂 Your files ({len(files)}):"
+    txt = f"📂 <b>Your files</b> ({len(files)} total):"
     if call:
         try:
             bot.answer_callback_query(call.id)
-            bot.edit_message_text(txt, chat_id, call.message.message_id, reply_markup=mk)
-        except:
-            bot.send_message(chat_id, txt, reply_markup=mk)
+            bot.edit_message_text(txt, chat_id, call.message.message_id, reply_markup=mk, parse_mode='HTML')
+        except Exception:
+            bot.send_message(chat_id, txt, reply_markup=mk, parse_mode='HTML')
     else:
-        bot.send_message(chat_id, txt, reply_markup=mk)
+        bot.send_message(chat_id, txt, reply_markup=mk, parse_mode='HTML')
+
+def _cb_files_page(c):
+    try:
+        _, uid_s, page_s = c.data.split('_', 2)
+        target_uid = int(uid_s); page = int(page_s)
+    except Exception:
+        bot.answer_callback_query(c.id, "Parse error."); return
+    if c.from_user.id != target_uid and c.from_user.id not in admin_ids:
+        bot.answer_callback_query(c.id, "Permission denied.", show_alert=True); return
+    _send_files(target_uid, c.message.chat.id, c, page=page)
 
 def _cb_speed(c):
     t = time.time()
@@ -1358,10 +1494,12 @@ def _cb_speed(c):
             f"⚡ <b>Ping:</b> <code>{lat}ms</code>\n"
             f"🟢 Scripts running: {scripts_running}\n"
             f"👥 Active users: {len(active_users)}\n"
-            f"🔒 Bot: {'Locked' if bot_locked else 'Unlocked'}",
+            f"🔒 Bot: {'Locked' if bot_locked else 'Unlocked'}\n"
+            f"🏷️ Version: {BOT_VERSION}",
             c.message.chat.id, c.message.message_id,
             reply_markup=main_inline(c.from_user.id), parse_mode='HTML')
-    except: pass
+    except Exception:
+        pass
 
 def _send_stats(uid, chat_id):
     ups, runs, last = db_get_stats(uid)
@@ -1374,9 +1512,10 @@ def _send_stats(uid, chat_id):
         total_files = sum(len(f) for f in user_files.values())
         total_running = sum(1 for k in list(bot_scripts.keys())
                             if is_running(int(k.split('_')[0]), k.split('_',1)[1]))
-        extra = f"\n📊 <b>Global:</b> {total_users} users, {total_files} files, {total_running} running"
+        extra = f"\n\n📊 <b>Global</b>\n{total_users} users · {total_files} files · {total_running} running"
     bot.send_message(chat_id,
                      f"📊 <b>Your Stats</b>\n"
+                     f"━━━━━━━━━━━━━━━\n"
                      f"🆔 <code>{uid}</code>  {user_status_str(uid)}\n"
                      f"📁 Files: {cnt}/{lim_str}\n"
                      f"⬆️ Total uploads: {ups}\n"
@@ -1395,11 +1534,11 @@ def _cb_back_main(c):
     lim_str = str(int(lim)) if lim != float('inf') else "∞"
     try:
         bot.edit_message_text(
-            f"🏠 <b>Main Menu</b>\n{user_status_str(uid)}  |  "
+            f"🏠 <b>Main Menu</b>\n{user_status_str(uid)}  ·  "
             f"Files: {file_count(uid)}/{lim_str}",
             c.message.chat.id, c.message.message_id,
             reply_markup=main_inline(uid), parse_mode='HTML')
-    except:
+    except Exception:
         bot.send_message(c.message.chat.id, "🏠 Main Menu",
                          reply_markup=main_inline(uid))
 
@@ -1440,7 +1579,7 @@ def cb_sendcmd_select(c):
 def _process_cmd_send(message, script_key):
     if message.text and message.text.lower() == '/cancel':
         bot.reply_to(message, "Cancelled."); return
-    cmd = message.text
+    cmd = message.text or ""
     dangerous = ['&&', '||', ';', '`', '$(']
     for d in dangerous:
         if d in cmd:
@@ -1466,6 +1605,11 @@ def _cb_toggle_lock(c):
     state = "🔒 Locked" if bot_locked else "🔓 Unlocked"
     bot.answer_callback_query(c.id, state)
     logger.warning(f"Bot {state} by admin {c.from_user.id}")
+    try:
+        bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id,
+                                       reply_markup=main_inline(c.from_user.id))
+    except Exception:
+        pass
 
 def _is_file_approved(uid, fn):
     return any(n == fn for n, t in user_files.get(uid, []))
@@ -1495,9 +1639,10 @@ def _cb_sub_menu(c):
     mk.add(types.InlineKeyboardButton('🔍 Check Sub', callback_data='check_subscription'))
     mk.add(types.InlineKeyboardButton('🔙 Back', callback_data='back_main'))
     try:
-        bot.edit_message_text("💳 Subscription Management", c.message.chat.id,
-                              c.message.message_id, reply_markup=mk)
-    except: pass
+        bot.edit_message_text("💳 <b>Subscription Management</b>", c.message.chat.id,
+                              c.message.message_id, reply_markup=mk, parse_mode='HTML')
+    except Exception:
+        pass
 
 def _cb_admin_panel(c):
     bot.answer_callback_query(c.id)
@@ -1507,9 +1652,10 @@ def _cb_admin_panel(c):
     mk.add(types.InlineKeyboardButton('📋 List Admins', callback_data='list_admins'))
     mk.add(types.InlineKeyboardButton('🔙 Back', callback_data='back_main'))
     try:
-        bot.edit_message_text("👑 Admin Panel", c.message.chat.id,
-                              c.message.message_id, reply_markup=mk)
-    except: pass
+        bot.edit_message_text("👑 <b>Admin Panel</b>", c.message.chat.id,
+                              c.message.message_id, reply_markup=mk, parse_mode='HTML')
+    except Exception:
+        pass
 
 def _cb_list_admins(c):
     bot.answer_callback_query(c.id)
@@ -1538,7 +1684,7 @@ def cb_broadcast(c):
     if c.data == 'bc_cancel':
         bot.answer_callback_query(c.id,"Cancelled.")
         try: bot.delete_message(c.message.chat.id, c.message.message_id)
-        except: pass
+        except Exception: pass
         return
     orig = c.message.reply_to_message
     if not orig:
@@ -1563,10 +1709,11 @@ def _execute_broadcast(orig, admin_chat):
                 try:
                     bot.copy_message(uid, orig.chat.id, orig.message_id)
                     sent += 1
-                except: failed += 1
+                except Exception:
+                    failed += 1
             else:
                 failed += 1
-        except:
+        except Exception:
             failed += 1
         if idx % 20 == 0 and idx > 0:
             time.sleep(1)
@@ -1576,7 +1723,8 @@ def _execute_broadcast(orig, admin_chat):
         bot.send_message(admin_chat,
                          f"📢 <b>Broadcast done</b>\n✅ {sent}  ❌ {failed}  🚫 {blocked}",
                          parse_mode='HTML')
-    except: pass
+    except Exception:
+        pass
 
 # ─── subscription step handlers ──────────────────────────────────────────────
 def _cb_add_sub_init(c):
@@ -1600,8 +1748,8 @@ def _process_add_sub(message):
         bot.reply_to(message, f"✅ Sub added for <code>{uid}</code> (+{days}d → {expiry.date()})",
                      parse_mode='HTML')
         try: bot.send_message(uid, f"🎉 Subscription added: +{days} days (expires {expiry.date()})")
-        except: pass
-    except:
+        except Exception: pass
+    except Exception:
         bot.reply_to(message, "⚠️ Invalid format. Use: USER_ID DAYS")
         m = bot.send_message(message.chat.id, "Try again or /cancel:")
         bot.register_next_step_handler(m, _process_add_sub)
@@ -1620,8 +1768,8 @@ def _process_rem_sub(message):
         db_remove_sub(uid)
         bot.reply_to(message, f"✅ Sub removed for <code>{uid}</code>", parse_mode='HTML')
         try: bot.send_message(uid, "ℹ️ Your subscription was removed by admin.")
-        except: pass
-    except:
+        except Exception: pass
+    except Exception:
         bot.reply_to(message, "⚠️ Invalid ID.")
 
 def _cb_check_sub_init(c):
@@ -1648,7 +1796,7 @@ def _process_check_sub(message):
                          parse_mode='HTML')
         else:
             bot.reply_to(message, f"ℹ️ No subscription for <code>{uid}</code>", parse_mode='HTML')
-    except:
+    except Exception:
         bot.reply_to(message, "⚠️ Invalid ID.")
 
 def _cb_add_admin_init(c):
@@ -1669,8 +1817,8 @@ def _process_add_admin(message):
         db_add_admin(uid)
         bot.reply_to(message, f"✅ <code>{uid}</code> is now admin.", parse_mode='HTML')
         try: bot.send_message(uid, "🎉 You are now an admin!")
-        except: pass
-    except:
+        except Exception: pass
+    except Exception:
         bot.reply_to(message, "⚠️ Invalid ID.")
 
 def _cb_rem_admin_init(c):
@@ -1689,14 +1837,16 @@ def _process_rem_admin(message):
         if db_remove_admin(uid):
             bot.reply_to(message, f"✅ <code>{uid}</code> removed from admin.", parse_mode='HTML')
             try: bot.send_message(uid, "ℹ️ You are no longer an admin.")
-            except: pass
+            except Exception: pass
         else:
             bot.reply_to(message, f"⚠️ Cannot remove <code>{uid}</code> (owner or not found).", parse_mode='HTML')
-    except:
+    except Exception:
         bot.reply_to(message, "⚠️ Invalid ID.")
 
 # ════════════════════════════════════════════════════════════════════════════
-#  CLEANUP
+#  CLEANUP + GRACEFUL SHUTDOWN
+#  (fixes: VPS reboots/service restarts sending SIGTERM and leaving orphaned
+#   child processes + a stale lock file that blocks the next boot)
 # ════════════════════════════════════════════════════════════════════════════
 def _cleanup():
     logger.warning("Shutdown — killing all scripts…")
@@ -1704,31 +1854,86 @@ def _cleanup():
         kill_tree(info)
     logger.warning("Cleanup done.")
 
+def _signal_handler(signum, frame):
+    logger.warning(f"Signal {signum} received — shutting down gracefully.")
+    _shutting_down.set()
+    try:
+        bot.stop_polling()
+    except Exception:
+        pass
+    _cleanup()
+    _release_lock()
+    sys.exit(0)
+
 atexit.register(_cleanup)
+atexit.register(_release_lock)
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT, _signal_handler)
 
 # ════════════════════════════════════════════════════════════════════════════
 #  MAIN
+#  Fixes applied here:
+#    1. Single-instance lock              → kills the #1 cause of 409 Conflict spam
+#    2. remove_webhook() before polling   → clears any stray webhook fighting getUpdates
+#    3. skip_pending=True                 → don't replay a backlog that can wedge threads
+#    4. allowed_updates filter            → less update noise, fewer surprise handlers firing
+#    5. bot.stop_polling() before every retry → no ghost worker threads piling up
+#    6. Explicit 409 handling + exponential backoff → stops the "infinite restart" burn loop
+#    7. exception_handler on TeleBot itself → handler bugs no longer silently kill threads
 # ════════════════════════════════════════════════════════════════════════════
 if __name__ == '__main__':
     logger.info("="*50)
-    logger.info("🤖 HostBot starting…")
+    logger.info(f"🤖 HostBot {BOT_VERSION} starting…")
     logger.info(f"Owner: {OWNER_ID}  |  Python: {sys.version.split()[0]}")
     logger.info("="*50)
+
+    _acquire_lock()
     init_db()
     load_data()
     _expire_stale_approvals()
     keep_alive()
+
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+    except Exception as e:
+        logger.warning(f"remove_webhook failed (non-fatal): {e}")
+
     logger.info("🚀 Polling…")
+    consecutive_failures = 0
     while True:
         try:
-            bot.infinity_polling(timeout=60, long_polling_timeout=30,
-                                 logger_level=logging.WARNING)
+            bot.infinity_polling(
+                timeout=60,
+                long_polling_timeout=30,
+                logger_level=logging.WARNING,
+                allowed_updates=['message', 'callback_query', 'chat_member', 'my_chat_member'],
+                skip_pending=True
+            )
         except requests.exceptions.ReadTimeout:
+            consecutive_failures = 0
             logger.warning("ReadTimeout — restarting poll in 5s")
+            bot.stop_polling()
             time.sleep(5)
         except requests.exceptions.ConnectionError as e:
+            consecutive_failures = 0
             logger.error(f"ConnectionError: {e} — retry in 15s")
+            bot.stop_polling()
             time.sleep(15)
+        except apihelper.ApiTelegramException as e:
+            bot.stop_polling()
+            if getattr(e, 'error_code', None) == 409:
+                logger.critical(
+                    "409 Conflict — another process is polling this token "
+                    "(old instance still alive, or a webhook is set elsewhere). Waiting 20s."
+                )
+                time.sleep(20)
+            else:
+                logger.error(f"Telegram API error: {e} — retry in 10s")
+                time.sleep(10)
         except Exception as e:
-            logger.critical(f"Polling crash: {e}", exc_info=True)
-            time.sleep(30)
+            consecutive_failures += 1
+            logger.critical(f"Polling crash #{consecutive_failures}: {e}", exc_info=True)
+            bot.stop_polling()
+            backoff = min(30 * consecutive_failures, 300)
+            time.sleep(backoff)
