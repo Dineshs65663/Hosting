@@ -37,7 +37,7 @@ from collections import defaultdict
 # ════════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION  — edit only this block
 # ════════════════════════════════════════════════════════════════════════════
-TOKEN        = '8839794329:AAF46urSAb-0pv1CTuMor7InEaWQf0KpPJM'   # ← your token
+TOKEN        = '8976866439:AAF4escWUv5tppxjB4zGfMV7woksxi6IFHI'   # ← your token
 OWNER_ID     = 8767249265
 ADMIN_ID     = 8767249265
 YOUR_USERNAME   = '@DKS65663'
