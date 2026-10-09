@@ -1,5 +1,3 @@
-
-"""
 import subprocess, sys, importlib
 
 # ─── Auto-install the bot's own dependencies (pip name → import name) ───────
