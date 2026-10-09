@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import shlex
 import shutil
@@ -1839,6 +1840,47 @@ def check_disk_quotas():
                          f'it uses {human_size(size)} of disk and the limit is {MAX_PROJECT_MB} MB. '
                          'Delete what you do not need under 📁 Files, then start it again.')
 
+# ─── One permanent spawner thread for every hosted script ─────────────────
+# bubblewrap's --die-with-parent uses PR_SET_PDEATHSIG, which the Linux
+# kernel ties to the THREAD that forked the sandbox, not to the hosting
+# bot's process. Scripts launched from short-lived threads — boot resume,
+# deploy after approval, "Run all", package installs, crash-restarts fired
+# from the _watch thread — were SIGKILL'd (exit code -9) as soon as the
+# calling thread returned, which the supervisor then counted as a crash
+# and restarted on another short-lived thread, feeding the loop.
+# Forking every sandbox from one long-lived thread fixes it: the "parent"
+# PDEATHSIG binds to lives as long as the bot does.
+_SPAWN_Q = queue.Queue()
+_spawner_thread = None
+_spawner_lock = threading.Lock()
+
+def _spawn_loop():
+    while True:
+        cmd, kw, out, done = _SPAWN_Q.get()
+        try:
+            out.append(subprocess.Popen(cmd, **kw))
+        except BaseException as e:
+            out.append(e)
+        done.set()
+
+def _ensure_spawner():
+    global _spawner_thread
+    with _spawner_lock:
+        if _spawner_thread is None or not _spawner_thread.is_alive():
+            _spawner_thread = threading.Thread(target=_spawn_loop, daemon=True,
+                                               name='script-spawner')
+            _spawner_thread.start()
+
+def _spawn(cmd, **kw):
+    """subprocess.Popen on one long-lived thread (see note above)."""
+    _ensure_spawner()
+    out, done = [], threading.Event()
+    _SPAWN_Q.put((cmd, kw, out, done))
+    done.wait()
+    if isinstance(out[0], BaseException):
+        raise out[0]
+    return out[0]
+
 def start_project(pid, auto=False, installs=0, tried=None):
     """Launch a project. Returns (ok, message). `auto` = restart by the supervisor."""
     proj = get_project(pid)
@@ -1907,7 +1949,7 @@ def start_project(pid, auto=False, installs=0, tried=None):
             kw['creationflags'] = (subprocess.CREATE_NEW_PROCESS_GROUP
                                    | getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         try:
-            proc = subprocess.Popen(_run_command(proj, backend), **kw)
+            proc = _spawn(_run_command(proj, backend), **kw)
         except FileNotFoundError:
             what = 'Node.js' if proj['file_type'] == 'js' else 'The interpreter'
             return False, f'{what} is not installed on this server.'
