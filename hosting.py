@@ -76,7 +76,7 @@ MAX_UNZIP_MB      = 100      # total size a zip may unpack to (zip-bomb guard)
 MAX_ZIP_FILES     = 2000
 
 # Sandbox / resource limits
-SANDBOX           = 'auto'   # 'auto' | 'docker' | 'bwrap' | 'process'
+SANDBOX           = 'auto'   # 'auto' | 'docker' | 'process'   (bubblewrap removed)
 DOCKER_PY_IMAGE   = 'python:3.12-slim'
 DOCKER_JS_IMAGE   = 'node:20-slim'
 MAX_RAM_MB        = 256      # per script (0 = no limit)
@@ -1204,89 +1204,31 @@ def _docker_works() -> bool:
 def _under(path, parents) -> bool:
     return any(path == par or path.startswith(par + os.sep) for par in parents)
 
-def _bwrap_prefix(pdir) -> list:
-    """bubblewrap arguments: the whole system is read-only, the bot's own folder
-    and the home directory are hidden, only this project's folder is writable."""
-    args = [shutil.which('bwrap') or 'bwrap', '--die-with-parent',
-            '--unshare-pid', '--unshare-ipc', '--unshare-uts',
-            '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp']
-    hidden = []
-    for path in (BASE_DIR, os.path.expanduser('~')):
-        path = os.path.realpath(path)
-        if path != os.sep and os.path.isdir(path) and not _under(path, hidden):
-            hidden.append(path)
-            args += ['--tmpfs', path]
-    # what scripts still need from inside a hidden folder: the interpreters and their packages
-    needed = {os.path.realpath(sys.prefix), os.path.realpath(sys.base_prefix)}
-    try:
-        import site
-        needed.add(os.path.realpath(site.getusersitepackages()))
-    except Exception:
-        pass
-    node = shutil.which('node')
-    if node:
-        needed.add(os.path.dirname(os.path.dirname(os.path.realpath(node))))
-    for path in sorted(needed):
-        if os.path.isdir(path) and _under(path, hidden) and path not in hidden:
-            args += ['--ro-bind', path, path]
-    return args + ['--bind', pdir, pdir, '--chdir', pdir]
-
-def _bwrap_works() -> bool:
-    """Run a tiny script inside bubblewrap and check that it starts, can write its
-    own folder and can NOT see this bot's files. Only then is bubblewrap used."""
-    if os.name != 'posix' or not shutil.which('bwrap'):
-        return False
-    probe = os.path.join(PROJECTS_DIR, '.sandbox_test')
-    code = ("import os\n"
-            "open('ok.txt', 'w').write('x')\n"
-            f"leak = os.path.exists({os.path.abspath(__file__)!r}) or os.path.exists({DATABASE_PATH!r})\n"
-            "print('LEAK' if leak else 'SAFE')\n")
-    try:
-        os.makedirs(probe, exist_ok=True)
-        r = subprocess.run(_bwrap_prefix(probe) + [sys.executable, '-c', code], capture_output=True,
-                           timeout=30, text=True, env=_child_env(probe, backend='bwrap'))
-        ok = r.returncode == 0 and r.stdout.strip() == 'SAFE' and os.path.isfile(os.path.join(probe, 'ok.txt'))
-        if not ok:
-            logger.warning('bubblewrap is installed but its self-test failed (%s) — not using it.',
-                           (r.stderr or r.stdout).strip()[-200:])
-        return ok
-    except Exception as e:
-        logger.warning('bubblewrap self-test error: %s', e)
-        return False
-    finally:
-        shutil.rmtree(probe, ignore_errors=True)
-
 def _is_local(backend) -> bool:
     """True when scripts are our own child processes (not Docker containers)."""
-    return backend in ('process', 'bwrap')
+    return backend == 'process'
 
 def sandbox_backend() -> str:
-    """'docker', 'bwrap', 'process' (no isolation) or 'unavailable' (the SANDBOX
-    setting demands a sandbox this server does not have)."""
+    """'docker', 'process' (no isolation) or 'unavailable' (the SANDBOX setting
+    demands Docker but this server does not have it)."""
     global _backend
     if _backend is None:
         if SANDBOX in ('auto', 'docker') and _docker_works():
             _backend = 'docker'
-        elif SANDBOX in ('auto', 'bwrap') and _bwrap_works():
-            _backend = 'bwrap'
-        elif SANDBOX in ('docker', 'bwrap'):
+        elif SANDBOX == 'docker':
             _backend = 'unavailable'
         else:
             _backend = 'process'
         if _backend == 'process':
             logger.warning('Sandbox: plain processes. Uploaded scripts are NOT isolated from this '
-                           'machine — install Docker or bubblewrap for real isolation.')
+                           'machine — install Docker for real isolation.')
         else:
             logger.info('Sandbox backend: %s', _backend)
-            if _backend == 'bwrap' and hasattr(os, 'getuid') and os.getuid() == 0:
-                logger.warning('The bot runs as root: sandboxed scripts can still READ system files. '
-                               'Run the bot as a normal user for stronger isolation.')
     return _backend
 
 def sandbox_label() -> str:
     return {'docker': '🛡 Docker container',
-            'bwrap': '🛡 bubblewrap sandbox',
-            'process': '⚠️ none (plain process — install Docker or bubblewrap)',
+            'process': '⚠️ none (plain process — install Docker for isolation)',
             'unavailable': f'❌ "{SANDBOX}" required but not available'}[sandbox_backend()]
 
 def _container(pid) -> str:
@@ -1306,7 +1248,7 @@ def _child_env(pdir, pid=None, backend='process') -> dict:
         env.update(project_env(pid))
     env.update(HOME=pdir, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8',
                PYTHONPATH=os.path.join(pdir, '.deps'),
-               npm_config_cache='/tmp/.npm' if backend == 'bwrap' else os.path.join(DATA_DIR, 'npm_cache'))
+               npm_config_cache=os.path.join(DATA_DIR, 'npm_cache'))
     return env
 
 _ENV_KEY = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,63}$')
@@ -1384,7 +1326,7 @@ def _run_command(proj, backend):
         inner = [sys.executable, '-u', main] + extra
     else:
         inner = [shutil.which('node') or 'node', main] + extra
-    return _bwrap_prefix(pdir) + inner if backend == 'bwrap' else inner
+    return inner
 
 # ════════════════════════════════════════════════════════════════════════════
 #  PACKAGE INSTALLATION  (only ever runs for approved projects)
@@ -1529,7 +1471,7 @@ def _install_command(proj, packages, backend):
         inner += list(packages or [])
     if backend == 'docker':
         return ['docker', 'run', '--rm', *_docker_mounts(pdir), _docker_image(proj), *inner]
-    return _bwrap_prefix(pdir) + inner if backend == 'bwrap' else inner
+    return inner
 
 def install_packages(proj, packages=None):
     """Install requirements.txt / package.json (packages=None) or the named
@@ -1841,15 +1783,11 @@ def check_disk_quotas():
                          'Delete what you do not need under 📁 Files, then start it again.')
 
 # ─── One permanent spawner thread for every hosted script ─────────────────
-# bubblewrap's --die-with-parent uses PR_SET_PDEATHSIG, which the Linux
-# kernel ties to the THREAD that forked the sandbox, not to the hosting
-# bot's process. Scripts launched from short-lived threads — boot resume,
-# deploy after approval, "Run all", package installs, crash-restarts fired
-# from the _watch thread — were SIGKILL'd (exit code -9) as soon as the
-# calling thread returned, which the supervisor then counted as a crash
-# and restarted on another short-lived thread, feeding the loop.
-# Forking every sandbox from one long-lived thread fixes it: the "parent"
-# PDEATHSIG binds to lives as long as the bot does.
+# Every child process is started (subprocess.Popen) from one long-lived
+# thread rather than from whatever short-lived thread happens to trigger a
+# launch — boot resume, deploy after approval, "Run all", package installs,
+# crash-restarts fired from the _watch thread. Keeping process creation on
+# a single stable thread avoids parent-thread lifetime surprises.
 _SPAWN_Q = queue.Queue()
 _spawner_thread = None
 _spawner_lock = threading.Lock()
@@ -1893,7 +1831,7 @@ def start_project(pid, auto=False, installs=0, tried=None):
         return False, 'The main file is missing on disk — please upload it again.'
     backend = sandbox_backend()
     if backend == 'unavailable':
-        need = 'Docker' if SANDBOX == 'docker' else 'bubblewrap'
+        need = 'Docker'
         return False, f'{need} is required (SANDBOX = "{SANDBOX}") but is not available on this server.'
     if TAMPER_CHECK:
         if proj['manifest'] is None:
