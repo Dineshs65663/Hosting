@@ -54,7 +54,7 @@ except ImportError:            # Windows
 TOKEN        = '8976866439:AAGgWhJnUX3jlAheU-H6Ac5VZnHBb5kwdPY'   # ← your token
 OWNER_ID     = 8767249265
 ADMIN_ID     = 8767249265
-YOUR_USERNAME   = '@DKS65663'
+YOUR_USERNAME   = '@Helix_dev'
 UPDATE_CHANNEL  = 'https://t.me/dkschattinggroup'
 FORCE_JOIN_CHANNELS = ["@dksinfo2266"]     # the bot must be an admin in these
 
