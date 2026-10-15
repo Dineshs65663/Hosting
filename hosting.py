@@ -22,7 +22,6 @@ import json
 import logging
 import math
 import os
-import queue
 import re
 import shlex
 import shutil
@@ -75,15 +74,11 @@ MAX_FILE_SIZE_MB  = 20       # Telegram bots cannot download files above 20 MB
 MAX_UNZIP_MB      = 100      # total size a zip may unpack to (zip-bomb guard)
 MAX_ZIP_FILES     = 2000
 
-# Sandbox / resource limits
-SANDBOX           = 'auto'   # 'auto' | 'docker' | 'process'   (bubblewrap removed)
-DOCKER_PY_IMAGE   = 'python:3.12-slim'
-DOCKER_JS_IMAGE   = 'node:20-slim'
-MAX_RAM_MB        = 256      # per script (0 = no limit)
-MAX_CPUS          = 0.5      # per script — enforced in Docker mode only
-MAX_PIDS          = 128      # per script — enforced in Docker mode only
-MAX_FILE_WRITE_MB = 512      # biggest single file a script may write (Linux, no-Docker mode)
-MAX_LOG_MB        = 5        # per script; at this size the log starts over (one backup kept)
+# Resource limits (scripts run directly on this server — Docker is not used)
+MAX_RAM_MB        = 0        # per script (0 = no limit)
+MAX_CPUS          = 0.5      # per script — only used together with CPU_LIMIT_SECONDS
+MAX_FILE_WRITE_MB = 0        # biggest single file a script may write (0 = no limit)
+MAX_LOG_MB        = 5        # per script; at this size the log starts over
 
 # Supervision
 MAX_RESTARTS      = 5        # crashes allowed inside RESTART_WINDOW before giving up
@@ -91,7 +86,7 @@ RESTART_WINDOW    = 600      # seconds
 RESTART_BACKOFF   = 5        # first retry delay; doubles each time (max 60s)
 START_CHECK_DELAY = 2.5      # seconds to wait before reporting "started"
 AUTO_INSTALL_MAX  = 5        # missing-package installs per start
-AUTO_INSTALL_UNKNOWN = False # False = packages not on the known/allowed list need an admin's OK
+AUTO_INSTALL_UNKNOWN = True  # True = any missing package is installed without asking an admin
 INSTALL_TIMEOUT   = 600      # seconds for pip / npm
 NPM_IGNORE_SCRIPTS = True    # do not run npm install scripts of dependencies
 
@@ -101,7 +96,7 @@ LIVE_LOG_INTERVAL = 4        # seconds between live-log refreshes
 LIVE_LOG_DURATION = 120      # a live log view stops by itself after this long
 SUB_REMIND_DAYS   = 3        # remind users this many days before a sub expires
 
-# Plans — free users get FREE_USER_LIMIT files and MAX_RAM_MB / MAX_CPUS per script.
+# Plans — free users get FREE_USER_LIMIT files.
 # Paid plans, lowest first. 'files' defaults to SUBSCRIBED_USER_LIMIT. 'stars' is
 # the price in Telegram Stars for 'days' days.
 PLANS = {
@@ -114,18 +109,14 @@ REFERRAL_BONUS_DAYS = 3      # days of the first plan for each new user someone 
 REFERRAL_MAX        = 20     # most invites that are rewarded per user
 
 # More limits
-MAX_PROJECT_MB      = 500    # disk per hosted file, including its packages (0 = no limit)
+MAX_PROJECT_MB      = 0      # disk per hosted file, including its packages (0 = no limit)
 DISK_CHECK_INTERVAL = 300    # seconds between disk-usage checks of a running script
-CPU_LIMIT_SECONDS   = 120    # without Docker: stop a script that stays above its CPU share this long (0 = off)
-SCRIPT_NICE         = 10     # without Docker: scripts run at lower priority than the bot (0 = off)
-MAX_NET_OUT_MB_PER_HOUR = 0  # Docker only: stop a script that uploads more than this per hour (0 = off)
-DOCKER_NETWORK      = 'hostbot_net'  # Docker only: private network, containers cannot reach each other
-TAMPER_CHECK        = True   # refuse to start code that changed on disk after it was approved
+CPU_LIMIT_SECONDS   = 0      # stop a script that stays above its CPU share this long (0 = off)
+SCRIPT_NICE         = 0      # scripts run at lower priority than the bot (0 = off)
+TAMPER_CHECK        = False  # refuse to start code that changed on disk after it was approved
 MAX_PARALLEL_INSTALLS = 1    # pip / npm runs allowed at the same time
 LOG_BACKUPS         = 3      # old log files kept per script
 MAX_ENV_VARS        = 30     # variables a user may set per hosted file
-PY_VERSIONS         = ['3.12', '3.11', '3.10', '3.13']   # selectable per file (Docker only)
-NODE_VERSIONS       = ['20', '18', '22']
 
 # Deploy from a Git link
 GIT_ENABLED         = True
@@ -1189,50 +1180,17 @@ class Ctx:
         return True
 
 # ════════════════════════════════════════════════════════════════════════════
-#  SANDBOX BACKEND
+#  HOW SCRIPTS ARE RUN  (directly on this server — Docker is not used)
 # ════════════════════════════════════════════════════════════════════════════
-_backend = None
-
-def _docker_works() -> bool:
-    if not shutil.which('docker'):
-        return False
-    try:
-        return subprocess.run(['docker', 'info'], capture_output=True, timeout=15).returncode == 0
-    except Exception:
-        return False
-
-def _under(path, parents) -> bool:
-    return any(path == par or path.startswith(par + os.sep) for par in parents)
-
 def _is_local(backend) -> bool:
-    """True when scripts are our own child processes (not Docker containers)."""
-    return backend == 'process'
+    """Scripts are always our own child processes."""
+    return True
 
 def sandbox_backend() -> str:
-    """'docker', 'process' (no isolation) or 'unavailable' (the SANDBOX setting
-    demands Docker but this server does not have it)."""
-    global _backend
-    if _backend is None:
-        if SANDBOX in ('auto', 'docker') and _docker_works():
-            _backend = 'docker'
-        elif SANDBOX == 'docker':
-            _backend = 'unavailable'
-        else:
-            _backend = 'process'
-        if _backend == 'process':
-            logger.warning('Sandbox: plain processes. Uploaded scripts are NOT isolated from this '
-                           'machine — install Docker for real isolation.')
-        else:
-            logger.info('Sandbox backend: %s', _backend)
-    return _backend
+    return 'process'
 
 def sandbox_label() -> str:
-    return {'docker': '🛡 Docker container',
-            'process': '⚠️ none (plain process — install Docker for isolation)',
-            'unavailable': f'❌ "{SANDBOX}" required but not available'}[sandbox_backend()]
-
-def _container(pid) -> str:
-    return f'hostbot_{int(pid)}'
+    return '⚙️ plain process (Docker not used)'
 
 _PASS_ENV = ('PATH', 'LANG', 'LC_ALL', 'TZ', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
              'http_proxy', 'https_proxy', 'no_proxy', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
@@ -1241,14 +1199,12 @@ _PASS_ENV = ('PATH', 'LANG', 'LC_ALL', 'TZ', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PR
              'APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'ProgramData', 'PREFIX', 'LD_LIBRARY_PATH')
 
 def _child_env(pdir, pid=None, backend='process') -> dict:
-    """A clean environment — the bot's own variables are not passed to scripts.
-    With `pid`, the variables the user set for that file are added."""
-    env = {k: os.environ[k] for k in _PASS_ENV if k in os.environ}
+    """The server's normal environment, plus the variables the user set for that file."""
+    env = dict(os.environ)
     if pid is not None:
         env.update(project_env(pid))
-    env.update(HOME=pdir, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8',
-               PYTHONPATH=os.path.join(pdir, '.deps'),
-               npm_config_cache=os.path.join(DATA_DIR, 'npm_cache'))
+    env.update(PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8',
+               PYTHONPATH=os.path.join(pdir, '.deps'))
     return env
 
 _ENV_KEY = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,63}$')
@@ -1271,62 +1227,12 @@ def _script_args(proj) -> list:
     except ValueError:
         return []
 
-def _docker_image(proj) -> str:
-    ver = proj['runtime'] or ''
-    if proj['file_type'] == 'py':
-        return f'python:{ver}-slim' if ver in PY_VERSIONS else DOCKER_PY_IMAGE
-    return f'node:{ver}-slim' if ver in NODE_VERSIONS else DOCKER_JS_IMAGE
-
-_net_ready = None
-
-def _docker_network_args() -> list:
-    """A private bridge network on which containers cannot talk to each other."""
-    global _net_ready
-    if not DOCKER_NETWORK:
-        return []
-    if _net_ready is None:
-        try:
-            ok = subprocess.run(['docker', 'network', 'inspect', DOCKER_NETWORK],
-                                capture_output=True, timeout=20).returncode == 0
-            if not ok:
-                ok = subprocess.run(['docker', 'network', 'create', '--driver', 'bridge', '-o',
-                                     'com.docker.network.bridge.enable_icc=false', DOCKER_NETWORK],
-                                    capture_output=True, timeout=30).returncode == 0
-            _net_ready = ok
-        except Exception:
-            _net_ready = False
-        if not _net_ready:
-            logger.warning('Could not create the Docker network %r — using the default network.', DOCKER_NETWORK)
-    return ['--network', DOCKER_NETWORK] if _net_ready else []
-
-def _docker_mounts(pdir) -> list:
-    args = ['-v', f'{pdir}:/app', '-w', '/app', '-e', 'HOME=/tmp',
-            '-e', 'PYTHONUNBUFFERED=1', '-e', 'PYTHONPATH=/app/.deps',
-            '-e', 'npm_config_cache=/tmp/.npm']
-    if hasattr(os, 'getuid'):       # files created inside stay owned by the bot's user
-        args += ['--user', f'{os.getuid()}:{os.getgid()}']
-    return args
-
 def _run_command(proj, backend):
-    pid, main = proj['id'], proj['main_file']
-    pdir = project_dir(pid)
-    lim = limits_for(proj['user_id'])
+    main = proj['main_file']
     extra = _script_args(proj)
-    if backend == 'docker':
-        inner = (['python', '-u', main] if proj['file_type'] == 'py' else ['node', main]) + extra
-        limits = ['--cpus', str(lim['cpus']), '--pids-limit', str(MAX_PIDS),
-                  '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL']
-        if lim['ram']:
-            limits += ['--memory', f"{lim['ram']}m", '--memory-swap', f"{lim['ram']}m"]
-        # user variables are passed by name; their values travel in the docker client's environment
-        env_flags = [part for key in project_env(pid) for part in ('-e', key)]
-        return ['docker', 'run', '--rm', '-i', '--name', _container(pid), *limits,
-                *_docker_network_args(), *_docker_mounts(pdir), *env_flags, _docker_image(proj), *inner]
     if proj['file_type'] == 'py':
-        inner = [sys.executable, '-u', main] + extra
-    else:
-        inner = [shutil.which('node') or 'node', main] + extra
-    return inner
+        return [sys.executable, '-u', main] + extra
+    return [shutil.which('node') or 'node', main] + extra
 
 # ════════════════════════════════════════════════════════════════════════════
 #  PACKAGE INSTALLATION  (only ever runs for approved projects)
@@ -1458,20 +1364,14 @@ def _install_command(proj, packages, backend):
             what = ['-r', 'requirements.txt']
         else:
             what = list(packages)
-        pip = ['pip'] if backend == 'docker' else [sys.executable, '-m', 'pip']
-        inner = pip + ['install', '--disable-pip-version-check', '--no-input', '--no-cache-dir',
-                       '-q', '--upgrade', '--target', '.deps'] + what
-    else:
-        if packages is None and not os.path.isfile(os.path.join(pdir, 'package.json')):
-            return None
-        npm = 'npm' if backend == 'docker' else (shutil.which('npm') or 'npm')
-        inner = [npm, 'install', '--no-audit', '--no-fund', '--omit=dev']
-        if NPM_IGNORE_SCRIPTS:
-            inner.append('--ignore-scripts')
-        inner += list(packages or [])
-    if backend == 'docker':
-        return ['docker', 'run', '--rm', *_docker_mounts(pdir), _docker_image(proj), *inner]
-    return inner
+        return [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input',
+                '--no-cache-dir', '-q', '--upgrade', '--target', '.deps'] + what
+    if packages is None and not os.path.isfile(os.path.join(pdir, 'package.json')):
+        return None
+    inner = [shutil.which('npm') or 'npm', 'install', '--no-audit', '--no-fund', '--omit=dev']
+    if NPM_IGNORE_SCRIPTS:
+        inner.append('--ignore-scripts')
+    return inner + list(packages or [])
 
 def install_packages(proj, packages=None):
     """Install requirements.txt / package.json (packages=None) or the named
@@ -1488,7 +1388,7 @@ def install_packages(proj, packages=None):
         INSTALLING.add(pid)
         try:
             r = subprocess.run(cmd, cwd=pdir, capture_output=True, timeout=INSTALL_TIMEOUT,
-                               env=None if backend == 'docker' else _child_env(pdir, backend=backend))
+                               env=_child_env(pdir))
             out = (r.stdout + b'\n' + r.stderr).decode('utf-8', errors='ignore').strip()
             return r.returncode == 0, out[-700:]
         except subprocess.TimeoutExpired:
@@ -1607,11 +1507,10 @@ def _pump(run, pid):
 # ════════════════════════════════════════════════════════════════════════════
 class Run:
     """A live script process."""
-    def __init__(self, proc, backend, container, log_start, installs, tried, limits):
-        self.proc, self.backend, self.container = proc, backend, container
+    def __init__(self, proc, backend, log_start, installs, tried, limits):
+        self.proc, self.backend = proc, backend
         self.ram_mb, self.cpus = limits['ram'], limits['cpus']   # from the owner's plan
         self.cpu_over_since = None      # when it went above its CPU share
-        self.net = deque()              # (time, bytes sent) samples — Docker only
         self.started = time.time()
         self.log_start = log_start      # log offset where this run's output begins
         self.installs = installs        # auto-installs done since the manual start
@@ -1660,12 +1559,7 @@ def _kill_tree(root_pid, group=False):
             pass
 
 def _kill_run(run):
-    if run.backend == 'docker':
-        try:
-            subprocess.run(['docker', 'kill', run.container], capture_output=True, timeout=20)
-        except Exception as e:
-            logger.warning('docker kill %s failed: %s', run.container, e)
-    _kill_tree(run.proc.pid, group=_is_local(run.backend))
+    _kill_tree(run.proc.pid, group=True)
     try:
         run.proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
@@ -1673,19 +1567,13 @@ def _kill_run(run):
 
 def _kill_orphan(proj, backend):
     """Kill a copy left over from a previous bot process (e.g. after a hard kill)."""
-    if backend == 'docker':
-        try:
-            subprocess.run(['docker', 'rm', '-f', _container(proj['id'])],
-                           capture_output=True, timeout=20)
-        except Exception:
-            pass
     old = proj['os_pid']
     if old and old != os.getpid():
         try:
             p = psutil.Process(old)
             if abs(p.create_time() - (proj['os_pid_ctime'] or 0)) < 2:
                 logger.warning('Killing orphaned process %s of project %s', old, proj['id'])
-                _kill_tree(old, group=_is_local(backend))
+                _kill_tree(old, group=True)
         except (psutil.Error, OSError):
             pass
 
@@ -1782,43 +1670,6 @@ def check_disk_quotas():
                          f'it uses {human_size(size)} of disk and the limit is {MAX_PROJECT_MB} MB. '
                          'Delete what you do not need under 📁 Files, then start it again.')
 
-# ─── One permanent spawner thread for every hosted script ─────────────────
-# Every child process is started (subprocess.Popen) from one long-lived
-# thread rather than from whatever short-lived thread happens to trigger a
-# launch — boot resume, deploy after approval, "Run all", package installs,
-# crash-restarts fired from the _watch thread. Keeping process creation on
-# a single stable thread avoids parent-thread lifetime surprises.
-_SPAWN_Q = queue.Queue()
-_spawner_thread = None
-_spawner_lock = threading.Lock()
-
-def _spawn_loop():
-    while True:
-        cmd, kw, out, done = _SPAWN_Q.get()
-        try:
-            out.append(subprocess.Popen(cmd, **kw))
-        except BaseException as e:
-            out.append(e)
-        done.set()
-
-def _ensure_spawner():
-    global _spawner_thread
-    with _spawner_lock:
-        if _spawner_thread is None or not _spawner_thread.is_alive():
-            _spawner_thread = threading.Thread(target=_spawn_loop, daemon=True,
-                                               name='script-spawner')
-            _spawner_thread.start()
-
-def _spawn(cmd, **kw):
-    """subprocess.Popen on one long-lived thread (see note above)."""
-    _ensure_spawner()
-    out, done = [], threading.Event()
-    _SPAWN_Q.put((cmd, kw, out, done))
-    done.wait()
-    if isinstance(out[0], BaseException):
-        raise out[0]
-    return out[0]
-
 def start_project(pid, auto=False, installs=0, tried=None):
     """Launch a project. Returns (ok, message). `auto` = restart by the supervisor."""
     proj = get_project(pid)
@@ -1830,9 +1681,6 @@ def start_project(pid, auto=False, installs=0, tried=None):
     if not os.path.isfile(os.path.join(pdir, proj['main_file'])):
         return False, 'The main file is missing on disk — please upload it again.'
     backend = sandbox_backend()
-    if backend == 'unavailable':
-        need = 'Docker'
-        return False, f'{need} is required (SANDBOX = "{SANDBOX}") but is not available on this server.'
     if TAMPER_CHECK:
         if proj['manifest'] is None:
             set_manifest(pid)                # imported from the old version: trust what is there now
@@ -1874,26 +1722,20 @@ def start_project(pid, auto=False, installs=0, tried=None):
                     f"{utcnow():%Y-%m-%d %H:%M:%S} UTC ────\n".encode('utf-8'))
             log_start = f.tell()
         kw = dict(cwd=pdir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                  stderr=subprocess.STDOUT, bufsize=0)
-        if _is_local(backend):
-            kw['env'] = _child_env(pdir, pid, backend)
-        else:                                # docker: -e NAME takes the value from the client's environment
-            user_env = project_env(pid)
-            if user_env:
-                kw['env'] = dict(os.environ, **user_env)
+                  stderr=subprocess.STDOUT, bufsize=0, env=_child_env(pdir, pid))
         if os.name == 'posix':
             kw['start_new_session'] = True       # own process group → the whole tree can be killed
         else:
             kw['creationflags'] = (subprocess.CREATE_NEW_PROCESS_GROUP
                                    | getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         try:
-            proc = _spawn(_run_command(proj, backend), **kw)
+            proc = subprocess.Popen(_run_command(proj, backend), **kw)
         except FileNotFoundError:
             what = 'Node.js' if proj['file_type'] == 'js' else 'The interpreter'
             return False, f'{what} is not installed on this server.'
         except OSError as e:
             return False, f'Could not launch: {e}'
-        if _is_local(backend) and resource is not None and hasattr(resource, 'prlimit'):
+        if resource is not None and hasattr(resource, 'prlimit'):
             try:
                 resource.prlimit(proc.pid, resource.RLIMIT_CORE, (0, 0))
                 if MAX_FILE_WRITE_MB:
@@ -1901,14 +1743,13 @@ def start_project(pid, auto=False, installs=0, tried=None):
                     resource.prlimit(proc.pid, resource.RLIMIT_FSIZE, (cap, cap))
             except (OSError, ValueError):
                 pass
-        if _is_local(backend) and SCRIPT_NICE:
+        if SCRIPT_NICE:
             try:                             # scripts never get priority over the bot itself
                 psutil.Process(proc.pid).nice(SCRIPT_NICE if os.name == 'posix'
                                               else psutil.BELOW_NORMAL_PRIORITY_CLASS)
             except (psutil.Error, OSError, AttributeError):
                 pass
-        run = Run(proc, backend, _container(pid), log_start, installs, tried or set(),
-                  limits_for(proj['user_id']))
+        run = Run(proc, backend, log_start, installs, tried or set(), limits_for(proj['user_id']))
         try:
             ctime = psutil.Process(proc.pid).create_time()
         except (psutil.Error, OSError):
@@ -1922,7 +1763,7 @@ def start_project(pid, auto=False, installs=0, tried=None):
         run.pump.start()
         threading.Thread(target=_watch, args=(run, pid), daemon=True, name=f'watch-{pid}').start()
         log_event('start', pid)
-        logger.info('Started project %s (%s) pid=%s backend=%s', pid, proj['name'], proc.pid, backend)
+        logger.info('Started project %s (%s) pid=%s', pid, proj['name'], proc.pid)
         return True, 'Started.'
     finally:
         with RUN_LOCK:
@@ -2062,8 +1903,7 @@ def proj_state(p) -> str:
              'needs package approval': '📦 Waiting for an admin to allow a package',
              'package denied': '❌ A package it needs was not allowed',
              'modified': '🚫 Blocked — its code changed after approval',
-             'disk quota': '💽 Stopped — disk limit reached',
-             'network quota': '🌐 Stopped — upload limit reached'}
+             'disk quota': '💽 Stopped — disk limit reached'}
     if reason in known:
         return known[reason]
     if p['last_exit'] not in (None, 0) and p['should_run']:
@@ -2075,54 +1915,10 @@ def run_stats(pid):
     run = RUNS.get(pid)
     return (run.cpu, run.rss) if run else (None, None)
 
-def _parse_size(text) -> int:
-    """'12.5MiB' / '1.2kB' / '3GB' → bytes."""
-    m = re.match(r'\s*([\d.]+)\s*([kKMGT]?)(i?)B', text or '')
-    if not m:
-        return 0
-    base = 1024 if m.group(3) or m.group(2) in ('', 'K') else 1000
-    return int(float(m.group(1)) * base ** ' KMGT'.index(m.group(2).upper() or ' '))
-
-def _sample_docker():
-    """Docker mode: read CPU / RAM / network of all containers in one call and
-    enforce the optional upload cap."""
-    live = {r.container: (pid, r) for pid, r in list(RUNS.items())
-            if r.backend == 'docker' and r.proc.poll() is None}
-    if not live:
-        return
-    try:
-        out = subprocess.run(['docker', 'stats', '--no-stream', '--format',
-                              '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}'],
-                             capture_output=True, timeout=30, text=True).stdout
-    except Exception as e:
-        logger.debug('docker stats failed: %s', e)
-        return
-    now = time.time()
-    for line in out.splitlines():
-        parts = line.strip().split('|')
-        if len(parts) != 4 or parts[0] not in live:
-            continue
-        pid, run = live[parts[0]]
-        try:
-            run.cpu = float(parts[1].strip().rstrip('%'))
-        except ValueError:
-            pass
-        run.rss = _parse_size(parts[2].split('/')[0])
-        sent = _parse_size(parts[3].split('/')[-1])
-        run.net.append((now, sent))
-        while run.net and now - run.net[0][0] > 3600:
-            run.net.popleft()
-        used = sent - run.net[0][1]
-        if MAX_NET_OUT_MB_PER_HOUR and used > MAX_NET_OUT_MB_PER_HOUR * 1024 * 1024:
-            threading.Thread(target=halt_project, daemon=True, args=(
-                pid, 'network quota', f'it uploaded {human_size(used)} within an hour; the limit is '
-                                      f'{MAX_NET_OUT_MB_PER_HOUR} MB.')).start()
-
 def _sample_runs():
-    """Without Docker: measure CPU/RAM of every script and enforce its plan's
-    RAM cap and (if it stays above it for CPU_LIMIT_SECONDS) its CPU share."""
+    """Measure CPU/RAM of every script and enforce the optional RAM / CPU limits."""
     for pid, run in list(RUNS.items()):
-        if not _is_local(run.backend) or run.proc.poll() is not None:
+        if run.proc.poll() is not None:
             continue
         try:
             root = psutil.Process(run.proc.pid)
@@ -2586,8 +2382,6 @@ def _maintenance_loop():
         tick += 1
         try:
             _sample_runs()
-            if tick % 3 == 0:
-                _sample_docker()
         except Exception:
             logger.exception('Resource sampling failed')
         if tick % 6 == 0:
@@ -2849,7 +2643,7 @@ def scr_file(ctx, viewer, p, note=None, show_tail=False):
     lines += ['', f'<b>Status:</b> {proj_state(p)}']
     if running and run:
         if not run.rss:
-            _sample_docker() if run.backend == 'docker' else _sample_runs()
+            _sample_runs()
         cpu, rss = run_stats(pid)
         cap = f' / {run.ram_mb} MB' if run.ram_mb else ''
         lines.append(f'⏱ Uptime: {human_dur(time.time() - run.started)} · PID <code>{run.proc.pid}</code>')
@@ -2985,22 +2779,18 @@ def run_schedules():
 def scr_settings(ctx, viewer, p, note=None):
     pid = p['id']
     n_env = q1('SELECT COUNT(*) n FROM project_env WHERE project_id=?', (pid,))['n']
-    docker = sandbox_backend() == 'docker'
     lines = [f"⚙️ <b>Settings — {esc(p['name'])}</b>", '',
              f'🔑 Variables: <b>{n_env}</b>',
              f"▶️ Arguments: <code>{esc(p['args'])}</code>" if p['args'] else '▶️ Arguments: none',
              f'⏰ {schedule_label(p)}',
-             f"🔔 Crash / finish messages: <b>{'muted' if p['mute'] else 'on'}</b>"]
-    if docker:
-        lines.append(f"🧬 Version: <b>{esc(p['runtime'] or 'default')}</b>")
-    lines += ['', '<i>Variables, arguments and version apply the next time the script starts.</i>']
+             f"🔔 Crash / finish messages: <b>{'muted' if p['mute'] else 'on'}</b>",
+             '', '<i>Variables and arguments apply the next time the script starts.</i>']
     if note:
         lines += ['', note]
     ctx.draw('\n'.join(lines), kb(
         [btn('🔑 Variables', f'fe:{pid}'), btn('▶️ Arguments', f'fa:{pid}')],
         [btn('⏰ Schedule', f'fsch:{pid}'),
          btn('🔔 Unmute messages' if p['mute'] else '🔕 Mute messages', f'fmute:{pid}')],
-        [btn('🧬 Version', f'fver:{pid}') if docker else None],
         [btn('🔙 Back', f'f:{pid}')]))
 
 def scr_env(ctx, p, note=None):
@@ -4597,41 +4387,6 @@ def r_mute(c, ctx, arg):
     ans(c, '🔔 Messages on' if p['mute'] else '🔕 Muted')
     scr_settings(ctx, c.from_user.id, get_project(p['id']))
 
-@route('fver')
-def r_version(c, ctx, arg):
-    p = proj_for(c, arg)
-    if not p:
-        return
-    if sandbox_backend() != 'docker':
-        ans(c, 'Versions can only be chosen when scripts run in Docker.', True)
-        return
-    versions = PY_VERSIONS if p['file_type'] == 'py' else NODE_VERSIONS
-    pid = p['id']
-    rows = [[btn(('✅ ' if v == p['runtime'] else '') + v, f'fvs:{pid}:{i}') for i, v in enumerate(versions)],
-            [btn(('✅ ' if not p['runtime'] else '') + 'Default', f'fvs:{pid}:d')],
-            [btn('🔙 Back', f'fset:{pid}')]]
-    ctx.draw(f"🧬 <b>Version — {esc(p['name'])}</b>\n\nWhich "
-             f"{'Python' if p['file_type'] == 'py' else 'Node.js'} should run it? "
-             'It applies at the next start; packages are installed again for the new version.', kb(*rows))
-
-@route('fvs')
-def r_version_set(c, ctx, arg):
-    head, choice = _split(arg)
-    p = proj_for(c, head)
-    if not p:
-        return
-    versions = PY_VERSIONS if p['file_type'] == 'py' else NODE_VERSIONS
-    idx = to_int(choice)
-    runtime = '' if choice == 'd' else (versions[idx] if idx is not None and 0 <= idx < len(versions) else None)
-    if runtime is None:
-        ans(c, 'Bad request.', True)
-        return
-    x('UPDATE projects SET runtime=? WHERE id=?', (runtime, p['id']))
-    shutil.rmtree(os.path.join(project_dir(p['id']), '.deps'), ignore_errors=True)   # built for the old version
-    ans(c, f'🧬 {runtime or "Default"}')
-    scr_settings(ctx, c.from_user.id, get_project(p['id']),
-                 note='✅ Version saved. Restart the script to apply.')
-
 @route('fsch')
 def r_schedule(c, ctx, arg):
     p = proj_for(c, arg)
@@ -5235,7 +4990,6 @@ def main():
     logger.info('Owner: %s  |  Python: %s', OWNER_ID, sys.version.split()[0])
     logger.info('=' * 50)
     init_db()
-    sandbox_backend()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             signal.signal(sig, _on_signal)
