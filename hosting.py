@@ -51,7 +51,7 @@ except ImportError:            # Windows
 # ════════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION  — edit only this block
 # ════════════════════════════════════════════════════════════════════════════
-TOKEN        = '8976866439:AAHkL9xOzyLedr5c6S6CG0NI2KEOOvUDEH4'   # ← your token
+TOKEN        = '8976866439:AAGgWhJnUX3jlAheU-H6Ac5VZnHBb5kwdPY'   # ← your token
 OWNER_ID     = 8767249265
 ADMIN_ID     = 8767249265
 YOUR_USERNAME   = '@DKS65663'
